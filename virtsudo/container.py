@@ -15,42 +15,7 @@ CONTAINER_NAME = "virtsudo-env"
 
 _VIRTSUDO_STORAGE = None
 
-
-def _detect_host_image():
-    try:
-        with open("/etc/os-release") as f:
-            data = f.read()
-    except FileNotFoundError:
-        return "docker.io/library/ubuntu:24.04"
-    id_like = ""
-    for line in data.splitlines():
-        if line.startswith("ID="):
-            val = line.split("=", 1)[1].strip('"')
-            mapping = {
-                "ubuntu": "docker.io/library/ubuntu:24.04",
-                "debian": "docker.io/library/debian:latest",
-                "arch": "docker.io/library/archlinux:latest",
-                "fedora": "docker.io/library/fedora:latest",
-            }
-            if val in mapping:
-                return mapping[val]
-            id_like = val
-    for line in data.splitlines():
-        if line.startswith("ID_LIKE="):
-            val = line.split("=", 1)[1].strip('"')
-            for like in val.split():
-                mapping = {
-                    "ubuntu": "docker.io/library/ubuntu:24.04",
-                    "debian": "docker.io/library/debian:latest",
-                    "arch": "docker.io/library/archlinux:latest",
-                    "fedora": "docker.io/library/fedora:latest",
-                }
-                if like in mapping:
-                    return mapping[like]
-    return "docker.io/library/ubuntu:24.04"
-
-
-CONTAINER_IMAGE = _detect_host_image()
+CONTAINER_IMAGE = "docker.io/library/archlinux:latest"
 
 
 def detect_runtime():

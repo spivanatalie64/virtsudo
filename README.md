@@ -124,19 +124,13 @@ virtsudo status
 
 ---
 
-## Container OS matching
+## Container image
 
-virtsudo reads `/etc/os-release` to pick a matching image:
-
-| Host OS | Container image |
-|---|---|
-| Arch Linux | `archlinux:latest` |
-| Ubuntu | `ubuntu:24.04` |
-| Debian | `debian:latest` |
-| Fedora | `fedora:latest` |
-| Unknown (fallback) | `ubuntu:24.04` |
+virtsudo uses **Arch Linux** (`archlinux:latest`) as the container image for all hosts.
 
 ---
+
+
 
 ## btrfs compatibility
 
