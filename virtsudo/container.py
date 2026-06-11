@@ -2,14 +2,55 @@
 
 import os
 import shutil
+import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 _RUNTIME = None
 _PREBUILT = False
+_LAST_CWD = None
 
-CONTAINER_IMAGE = "docker.io/library/ubuntu:24.04"
 CONTAINER_NAME = "virtsudo-env"
+
+_VIRTSUDO_STORAGE = None
+
+
+def _detect_host_image():
+    try:
+        with open("/etc/os-release") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return "docker.io/library/ubuntu:24.04"
+    id_like = ""
+    for line in data.splitlines():
+        if line.startswith("ID="):
+            val = line.split("=", 1)[1].strip('"')
+            mapping = {
+                "ubuntu": "docker.io/library/ubuntu:24.04",
+                "debian": "docker.io/library/debian:latest",
+                "arch": "docker.io/library/archlinux:latest",
+                "fedora": "docker.io/library/fedora:latest",
+            }
+            if val in mapping:
+                return mapping[val]
+            id_like = val
+    for line in data.splitlines():
+        if line.startswith("ID_LIKE="):
+            val = line.split("=", 1)[1].strip('"')
+            for like in val.split():
+                mapping = {
+                    "ubuntu": "docker.io/library/ubuntu:24.04",
+                    "debian": "docker.io/library/debian:latest",
+                    "arch": "docker.io/library/archlinux:latest",
+                    "fedora": "docker.io/library/fedora:latest",
+                }
+                if like in mapping:
+                    return mapping[like]
+    return "docker.io/library/ubuntu:24.04"
+
+
+CONTAINER_IMAGE = _detect_host_image()
 
 
 def detect_runtime():
@@ -25,8 +66,44 @@ def detect_runtime():
     )
 
 
+def _probe_btrfs_overlay(rt):
+    result = subprocess.run([rt, "info"], capture_output=True, text=True)
+    if result.returncode == 0:
+        return True
+    if "backing file system is unsupported for this graph driver" not in result.stderr:
+        return False
+
+    global _VIRTSUDO_STORAGE
+    storage_dir = Path(tempfile.mkdtemp(prefix="virtsudo-storage-"))
+    storage_dir.chmod(storage_dir.stat().st_mode | stat.S_IRWXU)
+    conf_dir = Path.home() / ".config" / "containers"
+    conf_dir.mkdir(parents=True, exist_ok=True)
+    storage_conf = conf_dir / "storage.conf"
+    if not storage_conf.exists():
+        storage_conf.write_text(
+            f"[storage]\n"
+            f"driver = \"vfs\"\n"
+            f"graphroot = \"{storage_dir}\"\n"
+            f"runroot = \"{storage_dir}/run\"\n"
+        )
+        _VIRTSUDO_STORAGE = storage_dir
+        db_file = Path.home() / ".local" / "share" / "containers" / "storage" / "db.sql"
+        if db_file.exists():
+            db_file.unlink()
+    result2 = subprocess.run([rt, "info"], capture_output=True, text=True)
+    if result2.returncode == 0:
+        return True
+    raise RuntimeError(
+        f"btrfs filesystem detected — podman overlay is unsupported. "
+        f"Set up a non-btrfs graphroot or install fuse-overlayfs.\n"
+        f"VFS fallback also failed at {storage_dir}."
+    )
+
+
 def check_available():
     rt = detect_runtime()
+    if _probe_btrfs_overlay(rt):
+        return rt
     try:
         subprocess.run([rt, "info"], capture_output=True, check=True)
     except subprocess.CalledProcessError:
@@ -57,26 +134,43 @@ def container_exists(rt):
     return CONTAINER_NAME in result.stdout.strip().splitlines()
 
 
+def _get_mounted_cwd(rt):
+    result = subprocess.run(
+        [rt, "inspect", CONTAINER_NAME, "--format", "{{range .Mounts}}{{.Source}}{{end}}"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
 def start_container():
+    global _LAST_CWD
     rt = check_available()
     ensure_image()
+    cwd = os.getcwd()
+    _LAST_CWD = cwd
+
     if container_exists(rt):
-        result = subprocess.run(
-            [rt, "inspect", CONTAINER_NAME, "--format", "{{.State.Status}}"],
-            capture_output=True, text=True,
-        )
-        status = result.stdout.strip()
-        if status == "running":
+        mounted = _get_mounted_cwd(rt)
+        if mounted != cwd:
+            subprocess.run([rt, "rm", "-f", CONTAINER_NAME],
+                           capture_output=True, check=False)
+            _PREBUILT = False
+        else:
+            result = subprocess.run(
+                [rt, "inspect", CONTAINER_NAME, "--format", "{{.State.Status}}"],
+                capture_output=True, text=True,
+            )
+            status = result.stdout.strip()
+            if status == "running":
+                return
+            subprocess.run([rt, "start", CONTAINER_NAME], check=True)
             return
-        subprocess.run([rt, "start", CONTAINER_NAME], check=True)
-        return
-    host_root = Path("/")
+
     subprocess.run(
         [
             rt, "run", "-d", "--name", CONTAINER_NAME,
-            "--userns=keep-id",
-            "-v", f"{host_root}:{host_root}:rslave",
-            "-w", os.getcwd(),
+            "--network=host",
+            "-v", f"{cwd}:{cwd}:rslave",
             CONTAINER_IMAGE,
             "sleep", "infinity",
         ],
@@ -84,13 +178,23 @@ def start_container():
     )
 
 
-def exec_in_container(cmd):
+def exec_in_container(cmd, capture_output=False):
     rt = check_available()
     start_container()
-    return subprocess.run([rt, "exec", "-i", CONTAINER_NAME] + cmd)
+    cwd = os.getcwd()
+    kwargs = {}
+    if capture_output:
+        kwargs["capture_output"] = True
+    return subprocess.run(
+        [rt, "exec", "-i", "-u", "0", "-w", cwd, CONTAINER_NAME] + cmd,
+        **kwargs,
+    )
 
 
 def exec_interactive(cmd):
     rt = check_available()
     start_container()
-    return subprocess.run([rt, "exec", "-it", CONTAINER_NAME] + cmd)
+    cwd = os.getcwd()
+    return subprocess.run(
+        [rt, "exec", "-it", "-u", "0", "-w", cwd, CONTAINER_NAME] + cmd,
+    )

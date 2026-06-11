@@ -5,17 +5,29 @@ Usage:
     python install.py [--user]
 """
 
-import os
-import shutil
-import stat
 import subprocess
 import sys
 from pathlib import Path
 
 
-def main():
-    install_user = "--user" in sys.argv
+def _pip_install(here):
+    base = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    strategies = [
+        ["--user", "--break-system-packages"],
+        ["--user"],
+        [],
+    ]
+    for flags in strategies:
+        cmd = base + flags + [str(here)]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode == 0:
+            return
+    print("error: all pip install strategies failed", file=sys.stderr)
+    print(f"last attempt stderr: {result.stderr.decode()}", file=sys.stderr)
+    sys.exit(1)
 
+
+def main():
     here = Path(__file__).resolve().parent
     virtsudo_pkg = here / "virtsudo"
 
@@ -23,21 +35,7 @@ def main():
         print("Error: virtsudo/ package not found alongside installer.", file=sys.stderr)
         sys.exit(1)
 
-    # Install the Python package
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "--upgrade"] +
-        (["--user"] if install_user else []) +
-        [str(here)]
-    )
-
-    # Write the activation script
-    site_packages = Path(
-        subprocess.run(
-            [sys.executable, "-c",
-             "import site; print(site.getsitepackages()[0] if not __import__('sys').argv[1:] else site.USER_SITE)"],
-            capture_output=True, text=True,
-        ).stdout.strip()
-    )
+    _pip_install(here)
 
     from virtsudo.utils.shell import write_activation_script, get_bin_dir, install_sudo_shim
     write_activation_script()

@@ -2,8 +2,10 @@
 """virtsudo — CLI entry point and subcommand dispatch."""
 
 import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 from virtsudo import VERSION, PROJECT_NAME
 from virtsudo.container import (
@@ -27,20 +29,62 @@ Usage:
     sudo --overwrite <command>          Run command with REAL host sudo
     virtsudo exec <command> [args...]   Explicitly run in container
     virtsudo activate                   Activate the sudo override for this shell
+    virtsudo activate --system          Replace /usr/bin/sudo with virtsudo shim
     virtsudo deactivate                 Deactivate the sudo override
+    virtsudo deactivate --system        Restore /usr/bin/sudo from backup
     virtsudo shell [shell]              Interactive container shell
     virtsudo status                     Show environment status
     virtsudo help-sudo                  Print sudo usage for virtsudo
     eval "$(virtsudo activate-source)"  Source activation script
 """
 
+SUDO_REAL = "/usr/bin/sudo.real"
+
+
+def _install_system_shim():
+    if os.geteuid() != 0:
+        print("error: --system requires root", file=sys.stderr)
+        sys.exit(1)
+    real = Path(SUDO_REAL)
+    sudo_bin = Path("/usr/bin/sudo")
+    if not real.exists() and sudo_bin.exists():
+        shutil.copy2(str(sudo_bin), str(real))
+    shim_content = r'''#!/bin/sh
+# virtsudo system shim — replaces /usr/bin/sudo
+_parse() {
+    local overwrite=0
+    local args=()
+    for arg in "$@"; do
+        if [ "$arg" = "--overwrite" ]; then
+            overwrite=1
+        elif [ "$arg" = "--help" ]; then
+            exec virtsudo help-sudo
+        else
+            args+=("$arg")
+        fi
+    done
+    if [ "$overwrite" -eq 1 ]; then
+        exec /usr/bin/sudo.real "${args[@]}"
+    else
+        exec virtsudo exec "${args[@]}"
+    fi
+}
+_parse "$@"
+'''
+    sudo_bin.write_text(shim_content)
+    sudo_bin.chmod(0o4755)
+
 
 def cmd_activate(args):
     rt = check_available()
     start_container()
+    system = "--system" in args
+    if system:
+        _install_system_shim()
+        print("virtsudo: system sudo replaced at /usr/bin/sudo (original at /usr/bin/sudo.real)")
+        return
     write_activation_script()
     install_sudo_shim()
-
     bindir = get_bin_dir()
     print(f"To activate virtsudo in your shell, run:")
     print(f"  eval \"$(virtsudo activate-source)\"")
@@ -53,6 +97,20 @@ def cmd_activate_source(args):
 
 
 def cmd_deactivate(args):
+    system = "--system" in args
+    if system:
+        if os.geteuid() != 0:
+            print("error: --system requires root", file=sys.stderr)
+            sys.exit(1)
+        real = Path(SUDO_REAL)
+        sudo_bin = Path("/usr/bin/sudo")
+        if real.exists():
+            shutil.move(str(real), str(sudo_bin))
+            sudo_bin.chmod(0o4755)
+            print("virtsudo: /usr/bin/sudo restored from backup")
+        else:
+            print("virtsudo: no backup found at /usr/bin/sudo.real")
+        return
     bindir = get_bin_dir()
     shim = bindir / "sudo"
     if shim.exists():
@@ -79,7 +137,7 @@ def cmd_status(args):
     rt = check_available()
     start_container()
 
-    result = exec_in_container(["cat", "/etc/os-release"])
+    result = exec_in_container(["cat", "/etc/os-release"], capture_output=True)
     os_info = "unknown"
     if result.returncode == 0:
         for line in result.stdout.decode().splitlines():
@@ -88,6 +146,7 @@ def cmd_status(args):
                 break
 
     active = os.environ.get("VIRTSUDO_ACTIVE") == "1"
+    system_active = Path("/usr/bin/sudo.real").exists() and not Path("/usr/bin/sudo").resolve().samefile("/usr/bin/sudo.real")
     image_status = subprocess.run(
         [rt, "image", "exists", CONTAINER_IMAGE], capture_output=True
     ).returncode == 0
@@ -100,14 +159,12 @@ def cmd_status(args):
     print(f"{PROJECT_NAME} v{VERSION}")
     print(f"  Runtime:           {rt}")
     print(f"  Image:             {CONTAINER_IMAGE}")
-    if image_status:
-        print(f"  Image pulled:      yes")
-    else:
-        print(f"  Image pulled:      no")
+    print(f"  Image pulled:      {'yes' if image_status else 'no'}")
     print(f"  Container:         {CONTAINER_NAME}")
     print(f"  Container exists:  {'yes' if CONTAINER_NAME in ctr_exists else 'no'}")
     print(f"  Container OS:      {os_info}")
-    print(f"  Virtual sudo:      {'ACTIVE' if active else 'inactive'}")
+    print(f"  User-mode active:  {'yes' if active else 'no'}")
+    print(f"  System-mode:       {'yes' if system_active else 'no'}")
     print(f"  Activation script: {write_activation_script()}")
 
 
@@ -121,10 +178,6 @@ Options:
                             Example: sudo --overwrite pacman -Syu
 
     --help                  Show this help.
-
-Note: All other flags and arguments are forwarded to the container.
-      The container has the host filesystem mounted, so file output
-      appears on your host immediately.
 """)
 
 
